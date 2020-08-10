@@ -1,12 +1,12 @@
 package runner
 
 import (
-	"bufio"
-	"fmt"
+	"encoding/json"
 	"os"
-	"path"
 	"sync"
+	"time"
 
+	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/naabu/pkg/scan"
 	"github.com/remeh/sizedwaitgroup"
 )
@@ -17,9 +17,12 @@ type Runner struct {
 	options *Options
 	scanner *scan.Scanner
 
-	ports       map[int]struct{}
-	excludedIps map[string]struct{}
-	wg          sync.WaitGroup
+	ports          map[int]struct{}
+	excludedIps    map[string]struct{}
+	wg             sync.WaitGroup
+	targets        map[string]struct{}
+	synprobesports map[int]struct{}
+	ackprobesports map[int]struct{}
 }
 
 // NewRunner creates a new runner struct instance by parsing
@@ -35,114 +38,155 @@ func NewRunner(options *Options) (*Runner, error) {
 		return nil, err
 	}
 
+	err = runner.parseProbesPorts(options)
+	if err != nil {
+		return nil, err
+	}
+
 	runner.excludedIps, err = parseExcludedIps(options)
 	if err != nil {
 		return nil, err
 	}
+
+	runner.targets = make(map[string]struct{})
 
 	return runner, nil
 }
 
 // RunEnumeration runs the ports enumeration flow on the targets specified
 func (r *Runner) RunEnumeration() error {
-	// Get the ports as specified by the user
-	ports, err := ParsePorts(r.options)
+	err := r.loadTargets()
 	if err != nil {
-		return fmt.Errorf("could not parse ports: %s", err)
+		return err
 	}
 
-	targets := make(chan string)
-	// start listener
-	r.wg.Add(1)
-	go r.EnumerateMultipleHosts(targets, ports)
-
-	// Check if only a single host is sent as input. Process the host now.
-	if r.options.Host != "" {
-		targets <- r.options.Host
-		close(targets)
-
-		r.wg.Wait()
-		return nil
+	// Connect Scan - Preload targets and perform ports spray scan
+	if !isRoot() {
+		return r.ConnectEnumeration()
 	}
 
-	// If we have multiple hosts as input,
-	if r.options.HostsFile != "" {
-		f, err := os.Open(r.options.HostsFile)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
+	// Syn Scan - Perform full scan towards the same host
+	return r.RawSocketEnumeration()
+}
 
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			targets <- scanner.Text()
-		}
+func (r *Runner) RawSocketEnumeration() error {
+	kvr := NewKVResults()
+	swg := sizedwaitgroup.New(r.options.Rate)
 
-		close(targets)
-
-		r.wg.Wait()
-		return nil
+	for target := range r.targets {
+		swg.Add()
+		go r.handleHost(&swg, target, kvr)
 	}
 
-	// If we have STDIN input, treat it as multiple hosts
-	if r.options.Stdin {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			targets <- scanner.Text()
-		}
+	swg.Wait()
 
-		close(targets)
+	r.handleOutput(kvr)
 
-		r.wg.Wait()
-	}
 	return nil
 }
 
-// EnumerateMultipleHosts enumerates hosts for ports.
-// We keep enumerating ports for a given host until we reach an error
-func (r *Runner) EnumerateMultipleHosts(targets chan string, ports map[int]struct{}) {
-	defer r.wg.Done()
+func (r *Runner) ConnectEnumeration() error {
+	// naive algorithm - ports spray
+	kvr := NewKVResults()
+	swg := sizedwaitgroup.New(r.options.Rate)
 
-	swg := sizedwaitgroup.New(r.options.Threads)
-
-	for host := range targets {
-		if host == "" {
-			continue
-		}
-
-		// Check if the host is a cidr
-		if scan.IsCidr(host) {
-			ips, err := scan.Ips(host)
-			if err != nil {
-				return
-			}
-
-			for _, ip := range ips {
+	for retry := 0; retry < r.options.Retries; retry++ {
+		for port := range r.ports {
+			for target := range r.targets {
 				swg.Add()
-				go r.handleHost(&swg, ip, ports)
+				go r.handleHostPort(&swg, target, port, kvr)
 			}
-
-		} else {
-			swg.Add()
-			go r.handleHost(&swg, host, ports)
 		}
 	}
 
 	swg.Wait()
+
+	r.handleOutput(kvr)
+
+	return nil
 }
 
-func (r *Runner) handleHost(swg *sizedwaitgroup.SizedWaitGroup, host string, ports map[int]struct{}) {
+func (r *Runner) handleHostPort(swg *sizedwaitgroup.SizedWaitGroup, host string, port int, kvr *KVResults) {
 	defer swg.Done()
 
-	// If the user has specifed an output file, use that output file instead
-	// of creating a new output file for each domain. Else create a new file
-	// for each domain in the directory.
+	if kvr.Has(host, port) {
+		return
+	}
+
+	open, err := scan.ConnectPort(host, port, time.Duration(r.options.Timeout)*time.Millisecond)
+	if open && err == nil {
+		kvr.AddPort(host, port)
+	}
+}
+
+func (r *Runner) handleHost(swg *sizedwaitgroup.SizedWaitGroup, host string, kvr *KVResults) {
+	defer swg.Done()
+
+	scanner, err := scan.NewScanner(time.Duration(r.options.Timeout)*time.Millisecond, r.options.Retries, r.options.Rate, r.options.Debug)
+	if err != nil {
+		gologger.Warningf("Could not start scan on host %s: %s\n", host, host, err)
+		return
+	}
+
+	results, _ := scanner.ScanSyn(host, r.ports)
+	kvr.SetPorts(host, results)
+}
+
+func (r *Runner) handleOutput(kvr *KVResults) {
+	var (
+		file   *os.File
+		err    error
+		output string
+	)
 	if r.options.Output != "" {
-		r.EnumerateSingleHost(host, ports, r.options.Output, true)
-	} else if r.options.OutputDirectory != "" {
-		outputFile := path.Join(r.options.OutputDirectory, host)
-		r.EnumerateSingleHost(host, ports, outputFile, false)
-	} else {
-		r.EnumerateSingleHost(host, ports, "", true)
+		output = r.options.Output
+		// If the output format is json, append .json
+		// else append .txt
+		if r.options.OutputDirectory != "" {
+			if r.options.JSON {
+				output += ".json"
+			} else {
+				output += ".txt"
+			}
+		}
+		file, err = os.Create(output)
+		if err != nil {
+			gologger.Errorf("Could not create file %s: %s\n", output, err)
+			return
+		}
+		defer file.Close()
+	}
+
+	for host, ports := range kvr.m {
+		gologger.Infof("Found %d ports on host %s\n", len(ports), host)
+
+		// console output
+		if r.options.JSON {
+			data := JSONResult{Host: host}
+			for port := range ports {
+				data.Port = port
+				b, err := json.Marshal(data)
+				if err != nil {
+					continue
+				}
+				gologger.Silentf("%s\n", string(b))
+			}
+		} else {
+			for _, port := range ports {
+				gologger.Silentf("%s:%d\n", host, port)
+			}
+		}
+
+		// file output
+		if file != nil {
+			if r.options.JSON {
+				err = WriteJSONOutput(host, ports, file)
+			} else {
+				err = WriteHostOutput(host, ports, file)
+			}
+			if err != nil {
+				gologger.Errorf("Could not write results to file %s for %s: %s\n", output, host, err)
+			}
+		}
 	}
 }
